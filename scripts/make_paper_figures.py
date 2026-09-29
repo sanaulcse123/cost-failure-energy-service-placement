@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 gap = {}
 ci = {}
 
-with open("variant_gap_summary.csv", newline="") as f:
+with open("results/summaries/variant_gap_summary.csv", newline="") as f:
     r = csv.DictReader(f)
     for row in r:
         key = (row["objective"], row["variant"])
@@ -59,7 +59,7 @@ plt.close(fig)
 
 runtime = defaultdict(list)
 
-with open("combined_runtime_by_scale.csv", newline="") as f:
+with open("results/summaries/combined_runtime_by_scale.csv", newline="") as f:
     r = csv.DictReader(f)
     for row in r:
         obj = row["objective"]
