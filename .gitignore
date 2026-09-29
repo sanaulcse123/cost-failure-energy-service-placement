@@ -1,0 +1,18 @@
+# Compiled binaries
+placement_heuristics
+*.o
+*.out
+
+# Temporary/editor files
+*~
+*.swp
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Debug / temporary experiment outputs
+stress_*
+corr_mid_*
+mid_*
