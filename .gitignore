@@ -1,3 +1,4 @@
+
 # Compiled binaries
 placement_heuristics
 *.o
@@ -16,3 +17,8 @@ __pycache__/
 stress_*
 corr_mid_*
 mid_*
+# Generated experiment outputs in repository root
+/heuristic_results.csv
+/exact_results.csv
+/final_heuristic_results.csv
+/final_exact_results.csv
