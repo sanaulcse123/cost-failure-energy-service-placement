@@ -1,7 +1,8 @@
 CXX := g++
 CXXFLAGS := -std=c++17 -O3 -DNDEBUG -Wall -Wextra -Wpedantic
-TARGET := placement_experiment
-SRC := placement_experiment.cpp
+
+TARGET := placement_heuristics
+SRC := src/placement_heuristics.cpp
 
 all: $(TARGET)
 
