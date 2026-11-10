@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -19,7 +20,7 @@ static constexpr double INF = std::numeric_limits<double>::infinity();
 static constexpr double EPS = 1e-12;
 
 enum class Objective { COST, RELIABILITY, ENERGY };
-enum class Variant { SEQ, MIN, MAX };
+enum class Variant { SEQ, MIN, MAX, RANDOM, LPT };
 
 static std::string objective_name(Objective q) {
     switch (q) {
@@ -35,6 +36,8 @@ static std::string variant_name(Variant h) {
         case Variant::SEQ: return "SEQ";
         case Variant::MIN: return "MIN";
         case Variant::MAX: return "MAX";
+        case Variant::RANDOM: return "RANDOM";
+        case Variant::LPT: return "LPT";
     }
     return "UNKNOWN";
 }
@@ -77,6 +80,8 @@ struct HeuristicResult {
     Variant variant{};
     Placement placement;
     Metrics metrics;
+    Metrics construction_metrics;
+    double construction_objective_value = INF;
     double objective_value = INF;
     double construction_ms = 0.0;
     double refinement_ms = 0.0;
@@ -268,8 +273,19 @@ static int choose_service_for_state(const Instance& in,
                                     Variant h,
                                     const std::vector<double>& residual,
                                     const std::vector<char>& active,
-                                    const std::vector<char>& unplaced) {
+                                    const std::vector<char>& unplaced,
+                                    const std::vector<int>& random_order) {
     int chosen_i = -1;
+    if (h == Variant::RANDOM) {
+        for (int i : random_order) if (unplaced[i]) return i;
+        return -1;
+    }
+    if (h == Variant::LPT) {
+        int largest = -1;
+        for (int i = 0; i < in.m; ++i)
+            if (unplaced[i] && service_tie_prefer(in, i, largest)) largest = i;
+        return largest;
+    }
 
     if (h == Variant::SEQ) {
         for (int i = 0; i < in.m; ++i) {
@@ -320,11 +336,12 @@ static bool greedy_construct_dfs(const Instance& in,
                                  Placement& pl,
                                  std::vector<double>& residual,
                                  std::vector<char>& active,
-                                 std::vector<char>& unplaced) {
+                                 std::vector<char>& unplaced,
+                                 const std::vector<int>& random_order) {
     if (placed_count == in.m) return true;
     if (!construction_necessary_conditions(in, residual, unplaced)) return false;
 
-    const int i = choose_service_for_state(in, q, h, residual, active, unplaced);
+    const int i = choose_service_for_state(in, q, h, residual, active, unplaced, random_order);
     if (i < 0) return false;
 
     const std::vector<NodeChoice> choices = ordered_node_choices(in, q, i, residual, active);
@@ -341,7 +358,7 @@ static bool greedy_construct_dfs(const Instance& in,
         active[j] = 1;
 
         if (greedy_construct_dfs(in, q, h, placed_count + 1,
-                                 pl, residual, active, unplaced)) {
+                                 pl, residual, active, unplaced, random_order)) {
             return true;
         }
 
@@ -362,7 +379,14 @@ static Placement greedy_construct(const Instance& in, Objective q, Variant h) {
     std::vector<char> active(in.p, 0);
     std::vector<char> unplaced(in.m, 1);
 
-    const bool found = greedy_construct_dfs(in, q, h, 0, pl, residual, active, unplaced);
+    std::vector<int> random_order(in.m);
+    std::iota(random_order.begin(), random_order.end(), 0);
+    // Fixed random service order per (instance, objective), independent of the heuristic result.
+    const uint64_t salt = 0x9e3779b97f4a7c15ULL ^ (uint64_t(in.m) << 32) ^ uint64_t(in.p)
+        ^ (uint64_t(static_cast<int>(q) + 1) * 0xbf58476d1ce4e5b9ULL);
+    std::mt19937_64 order_rng(in.seed ^ salt);
+    std::shuffle(random_order.begin(), random_order.end(), order_rng);
+    const bool found = greedy_construct_dfs(in, q, h, 0, pl, residual, active, unplaced, random_order);
     pl.feasible = found && verify_feasible(in, pl);
     if (!pl.feasible) {
         std::fill(pl.node_of.begin(), pl.node_of.end(), -1);
@@ -509,6 +533,8 @@ static HeuristicResult run_heuristic(const Instance& in, Objective q, Variant h)
     r.placement = greedy_construct(in, q, h);
     const auto c1 = Clock::now();
     r.construction_ms = std::chrono::duration<double, std::milli>(c1 - c0).count();
+    r.construction_metrics = evaluate(in, r.placement);
+    r.construction_objective_value = selected_metric(r.construction_metrics, q);
 
     const auto ref0 = Clock::now();
     if (r.placement.feasible) {
@@ -844,6 +870,71 @@ static std::string csv_double(double x) {
     return ss.str();
 }
 
+// Global admissible lower bound (not an exact optimum).
+// Nonnegative fixed activation terms are omitted to guarantee admissibility.
+static double global_objective_lb(const Instance& in, Objective q) {
+    double lb = 0.0;
+    for (int i = 0; i < in.m; ++i) {
+        double best = INF;
+        for (int j = 0; j < in.p; ++j) {
+            if (in.c[i] > in.C[j] + 1e-9) continue;
+            double v = 0.0;
+            if (q == Objective::COST) v = in.M[i][j];
+            else if (q == Objective::RELIABILITY)
+                v = in.omega[i] * (1.0 - std::exp(-in.lambda[j] * in.Texe[i][j]));
+            else v = in.Top * (in.Pmax[j] - in.Pidle[j]) * in.c[i] / in.C[j];
+            best = std::min(best, v);
+        }
+        if (!std::isfinite(best)) return INF;
+        lb += best;
+    }
+    return lb;
+}
+
+
+// Exact minimum activation charge among node subsets whose total
+// available capacity covers all service demand.  This is a relaxation:
+// capacity cover is necessary, but does not ensure unsplittable packing.
+// For the evaluated p <= 20, exhaustive subset enumeration is practical.
+struct ActivationCoverLB {
+    double cost = INF;
+    double energy_idle = INF;
+};
+
+static ActivationCoverLB activation_cover_lb(const Instance& in) {
+    if (in.p >= 25) throw std::runtime_error("Activation-cover enumeration supports p <= 24");
+    const double demand = std::accumulate(in.c.begin(), in.c.end(), 0.0);
+    const uint32_t count = uint32_t{1} << in.p;
+    std::vector<double> subset_capacity(count, 0.0);
+    std::vector<double> subset_cost(count, 0.0);
+    std::vector<double> subset_idle_energy(count, 0.0);
+    ActivationCoverLB result;
+    for (uint32_t mask = 1; mask < count; ++mask) {
+        const uint32_t prev = mask & (mask - 1);
+        const int j = __builtin_ctz(mask);
+        subset_capacity[mask] = subset_capacity[prev] + in.C[j];
+        subset_cost[mask] = subset_cost[prev] + in.kappa[j];
+        subset_idle_energy[mask] = subset_idle_energy[prev] + in.Top * in.Pidle[j];
+        if (subset_capacity[mask] + 1e-9 >= demand) {
+            result.cost = std::min(result.cost, subset_cost[mask]);
+            result.energy_idle = std::min(result.energy_idle, subset_idle_energy[mask]);
+        }
+    }
+    return result;
+}
+
+// Sum of individually minimized assignment charges is a relaxation of
+// capacity coupling.  The activation-cover bound separately relaxes
+// indivisible packing.  Since both components bound disjoint nonnegative
+// components of the objective, their sum is an admissible lower bound.
+static double stronger_global_objective_lb(const Instance& in, Objective q,
+                                           const ActivationCoverLB& cover) {
+    const double previous_lb = global_objective_lb(in, q);
+    if (q == Objective::COST) return previous_lb + cover.cost;
+    if (q == Objective::ENERGY) return previous_lb + cover.energy_idle;
+    return previous_lb; // Failure Exposure: unchanged until a verified capacity LP is added.
+}
+
 int main(int argc, char** argv) {
     try {
         const Config cfg = parse_args(argc, argv);
@@ -858,18 +949,21 @@ int main(int argc, char** argv) {
 
         const std::string hfile = cfg.prefix + "heuristic_results.csv";
         const std::string efile = cfg.prefix + "exact_results.csv";
+        const std::string bfile = cfg.prefix + "best_of_three_cross_objective.csv";
         std::ofstream hout(hfile);
         std::ofstream eout(efile);
-        if (!hout || !eout) throw std::runtime_error("Could not open output CSV files.");
+        std::ofstream bout(bfile);
+        if (!hout || !eout || !bout) throw std::runtime_error("Could not open output CSV files.");
 
-        hout << "m,p,seed,objective,variant,feasible,objective_value,cost_value,reliability_value,energy_value,active_nodes,construction_ms,refinement_ms,total_ms,exact_status,exact_value,gap_pct\n";
+        hout << "m,p,seed,objective,variant,feasible,objective_value,cost_value,reliability_value,energy_value,active_nodes,construction_ms,refinement_ms,total_ms,exact_status,exact_value,gap_pct,construction_objective_value,construction_cost,construction_reliability,construction_energy\n";
+        bout << "m,p,seed,optimized_objective,chosen_variant,optimized_value,cost_value,reliability_value,energy_value,lower_bound,certified_gap_upper_pct,exact_status,exact_value,exact_gap_pct,random_objective_value,random_total_ms,lpt_objective_value,lpt_total_ms,best_three_total_ms,old_lower_bound,old_certified_gap_upper_pct,activation_cover_lower_bound\n";
         eout << "m,p,seed,objective,status,value,runtime_ms,nodes_visited\n";
 
         const std::vector<Objective> objectives = {
             Objective::COST, Objective::RELIABILITY, Objective::ENERGY
         };
         const std::vector<Variant> variants = {
-            Variant::SEQ, Variant::MIN, Variant::MAX
+            Variant::SEQ, Variant::MIN, Variant::MAX, Variant::RANDOM, Variant::LPT
         };
 
         const int total_instances = static_cast<int>(scales.size()) * seeds;
@@ -882,7 +976,7 @@ int main(int argc, char** argv) {
                                                       cfg.slack_min, cfg.slack_max);
 
                 std::vector<HeuristicResult> hrs;
-                hrs.reserve(9);
+                hrs.reserve(15);
                 for (Objective q : objectives) {
                     for (Variant h : variants) {
                         HeuristicResult r = run_heuristic(in, q, h);
@@ -945,7 +1039,57 @@ int main(int argc, char** argv) {
                          << csv_double(r.total_ms) << ','
                          << exact_status << ','
                          << csv_double(exact_value) << ','
-                         << csv_double(gap) << '\n';
+                         << csv_double(gap) << ','
+                         << csv_double(r.construction_objective_value) << ','
+                         << csv_double(r.construction_metrics.cost) << ','
+                         << csv_double(r.construction_metrics.reliability) << ','
+                         << csv_double(r.construction_metrics.energy) << '\n';
+                }
+
+                const ActivationCoverLB cover_lb = activation_cover_lb(in);
+
+                // Evaluate all three metrics on the selected solution for each objective.
+                // RANDOM is a baseline, not a candidate in best-of-three.
+                for (int qi = 0; qi < 3; ++qi) {
+                    const Objective q = objectives[qi];
+                    const HeuristicResult* best = nullptr;
+                    const HeuristicResult* random = nullptr;
+                    const HeuristicResult* lpt = nullptr;
+                    double combined_ms = 0.0;
+                    for (const auto& r : hrs) {
+                        if (r.objective != q) continue;
+                        if (r.variant == Variant::RANDOM) { random = &r; continue; }
+                        if (r.variant == Variant::LPT) { lpt = &r; continue; }
+                        combined_ms += r.total_ms;
+                        if (r.placement.feasible &&
+                            (!best || r.objective_value < best->objective_value - EPS)) best = &r;
+                    }
+                    if (!best) throw std::runtime_error("No feasible best-of-three construction");
+                    const double old_lb = global_objective_lb(in, q);
+                    const double lb = stronger_global_objective_lb(in, q, cover_lb);
+                    const double old_certified = old_lb > EPS ?
+                        100.0 * (best->objective_value - old_lb) / old_lb : INF;
+                    const double certified = lb > EPS ?
+                        100.0 * (best->objective_value - lb) / lb : INF;
+                    const std::string status = (cfg.run_exact && small_for_exact) ? exact[qi].status : "NOT_RUN";
+                    const double zstar = (cfg.run_exact && small_for_exact) ? exact[qi].value : INF;
+                    const double exact_gap = status == "OPTIMAL" && zstar > EPS ?
+                        100.0 * (best->objective_value - zstar) / zstar : INF;
+                    bout << m << ',' << p << ',' << s << ',' << objective_name(q) << ','
+                         << variant_name(best->variant) << ',' << csv_double(best->objective_value) << ','
+                         << csv_double(best->metrics.cost) << ','
+                         << csv_double(best->metrics.reliability) << ','
+                         << csv_double(best->metrics.energy) << ','
+                         << csv_double(lb) << ',' << csv_double(certified) << ','
+                         << status << ',' << csv_double(zstar) << ',' << csv_double(exact_gap) << ','
+                         << csv_double(random ? random->objective_value : INF) << ','
+                         << csv_double(random ? random->total_ms : INF) << ','
+                         << csv_double(lpt ? lpt->objective_value : INF) << ','
+                         << csv_double(lpt ? lpt->total_ms : INF) << ','
+                         << csv_double(combined_ms) << ',' << csv_double(old_lb) << ','
+                         << csv_double(old_certified) << ','
+                         << csv_double(q == Objective::COST ? cover_lb.cost :
+                                       q == Objective::ENERGY ? cover_lb.energy_idle : 0.0) << '\n';
                 }
 
                 ++completed_instances;

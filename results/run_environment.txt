@@ -1,0 +1,13 @@
+utc_time=2026-11-10T18:57:46+00:00
+platform=Linux
+wsl=yes
+cpu_model=11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz
+logical_cpus=2
+memory_gib=3.83
+compiler_version=13.3.0
+flags=-std=c++17 -O3 -DNDEBUG -Wall -Wextra -Wpedantic
+executable=bin/placement_stronger
+seeds=30
+scales=8/4 10/4 12/5 20/8 40/12 80/20
+exact_time_limit_seconds=30
+benchmark_note=single complete run; runtime depends on machine and CPU load

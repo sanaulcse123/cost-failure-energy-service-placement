@@ -1,24 +1,11 @@
-
-# Compiled binaries
-placement_heuristics
-*.o
-*.out
-
-# Temporary/editor files
-*~
-*.swp
-.DS_Store
-
-# Python cache
+# Generated binaries and benchmark reruns (published results remain tracked)
+/build/
+/runs/
+/reports/
 __pycache__/
-*.pyc
-
-# Debug / temporary experiment outputs
-stress_*
-corr_mid_*
-mid_*
-# Generated experiment outputs in repository root
-/heuristic_results.csv
-/exact_results.csv
-/final_heuristic_results.csv
-/final_exact_results.csv
+*.py[cod]
+*.o
+*.log
+*~
+.DS_Store
+*Zone.Identifier*
